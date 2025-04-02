@@ -43,7 +43,7 @@ def scrape_article(url):
         return article.text
     except Exception as e:
         return f"Error scraping article: {str(e)}"
-# [Rest of your existing functions...]
+
 # Function to prepare text for model prediction
 def prepare_for_model(text):
     # First use your existing preprocessing function
@@ -69,7 +69,95 @@ def make_prediction(processed_text):
     confidence_percent = float(confidence) * 100
     
     return result, confidence_percent
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
 
+def extract_keywords(text, num_keywords=5):
+    # Create a TF-IDF vectorizer
+    vectorizer = TfidfVectorizer(stop_words='english', max_features=100)
+    
+    # We need a collection of documents for TF-IDF to work properly
+    # Here we split the text into sentences to create that collection
+    sentences = text.split('.')
+    
+    # Remove empty sentences
+    sentences = [sentence.strip() for sentence in sentences if len(sentence.strip()) > 10]
+    
+    if not sentences:
+        return text.split()[:num_keywords]  # Fallback to first few words
+    
+    # Fit and transform the sentences
+    tfidf_matrix = vectorizer.fit_transform(sentences)
+    
+    # Get feature names (words)
+    feature_names = vectorizer.get_feature_names_out()
+    
+    # Calculate the average TF-IDF score for each word across all sentences
+    avg_scores = np.mean(tfidf_matrix.toarray(), axis=0)
+    
+    # Create a dictionary of word: score
+    word_scores = {feature_names[i]: avg_scores[i] for i in range(len(feature_names))}
+    
+    # Sort words by score and get top keywords
+    sorted_words = sorted(word_scores.items(), key=lambda x: x[1], reverse=True)
+    keywords = [word for word, score in sorted_words[:num_keywords]]
+    
+    return keywords
+
+def extract_keywords_with_entities(text, num_keywords=5):
+    try:
+        import spacy
+        
+        # Load spaCy model
+        nlp = spacy.load("en_core_web_sm")
+        
+        # Process the text
+        doc = nlp(text[:5000])  # Limit text length to avoid processing too much
+        
+        # Extract named entities
+        entities = [ent.text for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE', 'LOC', 'PRODUCT']]
+        
+        # Extract nouns and proper nouns
+        nouns = [token.text for token in doc if token.pos_ in ['NOUN', 'PROPN'] and len(token.text) > 3]
+        
+        # Combine entities and nouns, prioritizing entities
+        keywords = []
+        keywords.extend(entities)
+        keywords.extend([noun for noun in nouns if noun not in keywords])
+        
+        # Return unique keywords
+        return list(dict.fromkeys(keywords))[:num_keywords]
+    
+    except (ImportError, OSError):
+        # Fallback if spaCy is not available or model not installed
+        return text.split()[:num_keywords]
+
+def extract_keywords_simple(text, num_keywords=5):
+    import re
+    from collections import Counter
+    
+    # Convert to lowercase and remove special characters
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    # Split into words
+    words = text.split()
+    
+    # Remove common stop words
+    stop_words = {'the', 'and', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 
+                  'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 
+                  'had', 'do', 'does', 'did', 'but', 'or', 'as', 'if', 'while', 'because', 
+                  'then', 'also', 'so', 'that', 'this', 'these', 'those', 'it', 'its', 'from'}
+    
+    filtered_words = [word for word in words if word not in stop_words and len(word) > 3]
+    
+    # Count word frequencies
+    word_counts = Counter(filtered_words)
+    
+    # Get the most common words
+    common_words = [word for word, count in word_counts.most_common(num_keywords)]
+    
+    return common_words
 # Search Twitter for related content
 def search_twitter(text, twitter_client):
     try:
@@ -90,11 +178,14 @@ def search_twitter(text, twitter_client):
 # Search Reddit for related content
 def search_reddit(text, reddit_client):
     try:
-        # Extract keywords (simple implementation)
-        keywords = ' '.join(text.split()[:10])
+        # Extract better keywords using spaCy NER and POS tagging
+        keywords = extract_keywords_with_entities(text, num_keywords=5)
+        
+        # Join keywords with OR for broader search
+        search_query = ' OR '.join(keywords)
         
         # Search Reddit
-        submissions = reddit_client.subreddit("all").search(keywords, limit=5)
+        submissions = reddit_client.subreddit("all").search(search_query, limit=5)
         
         # Extract relevant information
         return [{"title": post.title, "url": post.url, "score": post.score} 
