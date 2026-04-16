@@ -6,4 +6,8 @@ nltk
 flask
 matplotlib
 seaborn
-newspaper
+newspaper3k
+tweepy
+praw
+python-dotenv
+lxml_html_clean

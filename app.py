@@ -2,6 +2,8 @@ from flask import Flask, request, render_template
 import tensorflow as tf
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 import pickle
+import re
+from collections import Counter
 from newspaper import Article
 import tweepy
 import praw
@@ -18,6 +20,18 @@ app = Flask(__name__)
 model = tf.keras.models.load_model('models/fake_news_lstm.h5')
 with open('models/tokenizer.pkl', 'rb') as f:
     tokenizer = pickle.load(f)
+
+NEWS_SUBREDDITS = [
+    "news",
+    "worldnews",
+    "inthenews",
+    "politics",
+    "technology",
+    "business",
+    "india",
+    "entertainment",
+    "bollywood",
+]
 
 # Initialize APIs
 def init_twitter():
@@ -59,16 +73,20 @@ def prepare_for_model(text):
 # Make prediction using the loaded model
 def make_prediction(processed_text):
     # Get raw prediction
-    prediction_prob = model.predict(processed_text)[0][0]
+    prediction_prob = float(model.predict(processed_text)[0][0])
     
-    # Convert to binary classification with confidence
-    is_fake = prediction_prob > 0.5
-    confidence = prediction_prob if is_fake else 1 - prediction_prob
+    # Training labels are 0=fake, 1=real, so sigmoid > 0.5 means real.
+    is_real = prediction_prob > 0.5
+    confidence = prediction_prob if is_real else 1 - prediction_prob
+    real_probability = prediction_prob
+    fake_probability = 1 - prediction_prob
     
-    result = "Fake News" if is_fake else "Real News"
+    result = "Real News" if is_real else "Fake News"
     confidence_percent = float(confidence) * 100
+    real_probability_percent = float(real_probability) * 100
+    fake_probability_percent = float(fake_probability) * 100
     
-    return result, confidence_percent
+    return result, confidence_percent, real_probability_percent, fake_probability_percent
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 
@@ -133,9 +151,6 @@ def extract_keywords_with_entities(text, num_keywords=5):
         return text.split()[:num_keywords]
 
 def extract_keywords_simple(text, num_keywords=5):
-    import re
-    from collections import Counter
-    
     # Convert to lowercase and remove special characters
     text = text.lower()
     text = re.sub(r'[^\w\s]', '', text)
@@ -158,18 +173,59 @@ def extract_keywords_simple(text, num_keywords=5):
     common_words = [word for word, count in word_counts.most_common(num_keywords)]
     
     return common_words
+
+def build_search_terms(text, num_terms=6):
+    cleaned_text = preprocess_text(text)
+    tokens = [token for token in cleaned_text.split() if len(token) > 3]
+
+    if not tokens:
+        tokens = re.findall(r"[a-zA-Z]{4,}", text.lower())
+
+    if not tokens:
+        return []
+
+    token_counts = Counter(tokens)
+    return [word for word, _ in token_counts.most_common(num_terms)]
+
+
+def calculate_relevance_score(source_text, query_terms):
+    if not source_text or not query_terms:
+        return 0.0
+
+    source_tokens = set(re.findall(r"[a-zA-Z]{3,}", source_text.lower()))
+    if not source_tokens:
+        return 0.0
+
+    query_set = set(query_terms)
+    overlap = len(source_tokens.intersection(query_set))
+    return overlap / max(len(query_set), 1)
+
+
 # Search Twitter for related content
 def search_twitter(text, twitter_client):
     try:
-        # Extract keywords (simple implementation)
-        keywords = ' '.join(text.split()[:10])
+        query_terms = build_search_terms(text)
+        if not query_terms:
+            return []
+
+        query = f"({' OR '.join(query_terms[:5])}) -is:retweet lang:en"
         
         # Search Twitter
-        response = twitter_client.search_recent_tweets(query=keywords, max_results=5)
+        response = twitter_client.search_recent_tweets(query=query, max_results=10)
         
         # Extract relevant information
         if response.data:
-            return [{"text": tweet.text, "id": tweet.id} for tweet in response.data]
+            ranked = []
+            for tweet in response.data:
+                relevance = calculate_relevance_score(tweet.text, query_terms)
+                ranked.append({
+                    "text": tweet.text,
+                    "id": tweet.id,
+                    "relevance": relevance,
+                })
+
+            ranked.sort(key=lambda item: item["relevance"], reverse=True)
+            return ranked[:5]
         return []
     except Exception as e:
         print(f"Twitter API error: {str(e)}")
@@ -178,18 +234,72 @@ def search_twitter(text, twitter_client):
 # Search Reddit for related content
 def search_reddit(text, reddit_client):
     try:
-        # Extract better keywords using spaCy NER and POS tagging
-        keywords = extract_keywords_with_entities(text, num_keywords=5)
-        
-        # Join keywords with OR for broader search
-        search_query = ' OR '.join(keywords)
-        
-        # Search Reddit
-        submissions = reddit_client.subreddit("all").search(search_query, limit=5)
-        
-        # Extract relevant information
-        return [{"title": post.title, "url": post.url, "score": post.score} 
-                for post in submissions]
+        query_terms = build_search_terms(text)
+        if not query_terms:
+            return []
+
+        search_query = " ".join(query_terms[:5])
+        phrase_query = f'"{" ".join(query_terms[:3])}"' if len(query_terms) >= 2 else search_query
+        seen_ids = set()
+        candidates = []
+
+        search_batches = [
+            {
+                "subreddits": NEWS_SUBREDDITS,
+                "query": phrase_query,
+                "time_filter": "year",
+                "limit": 10,
+                "min_relevance": 0.12,
+                "scope": "focused",
+            },
+            {
+                "subreddits": ["all"],
+                "query": search_query,
+                "time_filter": "year",
+                "limit": 20,
+                "min_relevance": 0.06,
+                "scope": "broad",
+            },
+        ]
+
+        for batch in search_batches:
+            for subreddit_name in batch["subreddits"]:
+                subreddit = reddit_client.subreddit(subreddit_name)
+                submissions = subreddit.search(
+                    batch["query"],
+                    sort="relevance",
+                    time_filter=batch["time_filter"],
+                    limit=batch["limit"],
+                )
+
+                for post in submissions:
+                    if post.id in seen_ids:
+                        continue
+                    seen_ids.add(post.id)
+
+                    source_text = f"{post.title} {getattr(post, 'selftext', '')}"
+                    relevance = calculate_relevance_score(source_text, query_terms)
+                    if relevance < batch["min_relevance"]:
+                        continue
+
+                    candidates.append({
+                        "title": post.title,
+                        "url": post.url,
+                        "score": post.score,
+                        "num_comments": getattr(post, "num_comments", 0),
+                        "subreddit": str(post.subreddit),
+                        "relevance": round(relevance * 100, 1),
+                        "scope": batch["scope"],
+                    })
+
+            if candidates:
+                break
+
+        candidates.sort(
+            key=lambda item: (item["relevance"], item["num_comments"], item["score"]),
+            reverse=True,
+        )
+        return candidates[:6]
     except Exception as e:
         print(f"Reddit API error: {str(e)}")
         return []
@@ -197,13 +307,14 @@ def search_reddit(text, reddit_client):
 @app.route('/', methods=['GET', 'POST'])
 def home():
     if request.method == 'POST':
-        text = request.form['text']
-        if text.startswith('http'):
-            text = scrape_article(text)
+        user_input = request.form['text']
+        text = user_input
+        if user_input.startswith('http'):
+            text = scrape_article(user_input)
        
         # Preprocessing and prediction logic
         processed_text = prepare_for_model(text)
-        prediction, confidence = make_prediction(processed_text)
+        prediction, confidence, real_probability, fake_probability = make_prediction(processed_text)
        
         # Search social media
         twitter = init_twitter()
@@ -215,8 +326,12 @@ def home():
             'index.html',
             result=prediction,
             confidence=confidence,
+            real_probability=real_probability,
+            fake_probability=fake_probability,
+            original_input=user_input,
             twitter_posts=twitter_results,
             reddit_posts=reddit_results,
+            query_terms=build_search_terms(text),
             now=datetime.now
         )
     return render_template('index.html')
