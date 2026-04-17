@@ -35,11 +35,37 @@ NEWS_SUBREDDITS = [
 
 # Initialize APIs
 def init_twitter():
-    return tweepy.Client(
-        consumer_key=os.getenv('TWITTER_API_KEY'),
-        consumer_secret=os.getenv('TWITTER_API_SECRET'),
-        access_token=os.getenv('TWITTER_ACCESS_TOKEN'),
-        access_token_secret=os.getenv('TWITTER_ACCESS_SECRET')
+    bearer_token = os.getenv('TWITTER_BEARER_TOKEN')
+    consumer_key = os.getenv('TWITTER_API_KEY')
+    consumer_secret = os.getenv('TWITTER_API_SECRET')
+    access_token = os.getenv('TWITTER_ACCESS_TOKEN')
+    access_token_secret = os.getenv('TWITTER_ACCESS_SECRET')
+
+    if bearer_token:
+        # Preferred for v2 recent search when available.
+        client = tweepy.Client(
+            bearer_token=bearer_token,
+            consumer_key=consumer_key,
+            consumer_secret=consumer_secret,
+            access_token=access_token,
+            access_token_secret=access_token_secret,
+            wait_on_rate_limit=True,
+        )
+        return client, False
+
+    if all([consumer_key, consumer_secret, access_token, access_token_secret]):
+        # OAuth1 user context fallback for accounts without bearer token configured.
+        client = tweepy.Client(
+            consumer_key=consumer_key,
+            consumer_secret=consumer_secret,
+            access_token=access_token,
+            access_token_secret=access_token_secret,
+            wait_on_rate_limit=True,
+        )
+        return client, True
+
+    raise ValueError(
+        "Missing Twitter credentials. Provide TWITTER_BEARER_TOKEN or full OAuth1 keys in .env"
     )
 
 def init_reddit():
@@ -204,6 +230,7 @@ def calculate_relevance_score(source_text, query_terms):
 # Search Twitter for related content
 def search_twitter(text, twitter_client):
     try:
+        client, user_auth = twitter_client
         query_terms = build_search_terms(text)
         if not query_terms:
             return []
@@ -211,25 +238,50 @@ def search_twitter(text, twitter_client):
         query = f"({' OR '.join(query_terms[:5])}) -is:retweet lang:en"
         
         # Search Twitter
-        response = twitter_client.search_recent_tweets(query=query, max_results=10)
+        response = client.search_recent_tweets(
+            query=query,
+            max_results=10,
+            tweet_fields=["created_at", "public_metrics", "lang"],
+            user_auth=user_auth,
+        )
         
         # Extract relevant information
         if response.data:
             ranked = []
             for tweet in response.data:
                 relevance = calculate_relevance_score(tweet.text, query_terms)
+                metrics = getattr(tweet, "public_metrics", {}) or {}
                 ranked.append({
                     "text": tweet.text,
                     "id": tweet.id,
                     "relevance": relevance,
+                    "likes": metrics.get("like_count", 0),
+                    "retweets": metrics.get("retweet_count", 0),
                 })
 
-            ranked.sort(key=lambda item: item["relevance"], reverse=True)
+            ranked.sort(
+                key=lambda item: (item["relevance"], item["likes"], item["retweets"]),
+                reverse=True,
+            )
             return ranked[:5]
         return []
+    except tweepy.errors.Forbidden as e:
+        message = (
+            "Twitter access forbidden. Check app/project permissions and whether recent search is enabled for your account tier."
+        )
+        print(f"Twitter API forbidden: {str(e)}")
+        return [{"text": message, "id": ""}]
+    except tweepy.errors.Unauthorized as e:
+        message = "Twitter authentication failed. Recheck .env keys and regenerate tokens if needed."
+        print(f"Twitter API unauthorized: {str(e)}")
+        return [{"text": message, "id": ""}]
+    except tweepy.errors.TooManyRequests as e:
+        message = "Twitter rate limit reached. Try again in a few minutes."
+        print(f"Twitter API rate limit: {str(e)}")
+        return [{"text": message, "id": ""}]
     except Exception as e:
         print(f"Twitter API error: {str(e)}")
-        return [{"text": "Unable to retrieve Twitter data due to API limitations.", "id": ""}]
+        return [{"text": f"Unable to retrieve Twitter data: {str(e)}", "id": ""}]
 
 # Search Reddit for related content
 def search_reddit(text, reddit_client):
